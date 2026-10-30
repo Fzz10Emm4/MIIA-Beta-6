@@ -1,0 +1,159 @@
+name: Compilar APK de MIIA
+
+# Se ejecuta a mano (pestaña Actions > Compilar APK de MIIA > Run workflow) o al cambiar el código de la app.
+# No se vuelve a ejecutar cuando MIIA sincroniza su memoria (esos archivos viven en cloud/ y server/).
+on:
+  workflow_dispatch:
+    inputs:
+      voice_model:
+        description: "Voz offline (modelo de sherpa-onnx). Vacío = vits-piper-es_ES-sharvard-medium"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "main.py"
+      - "miia_core.py"
+      - "miia_android/**"
+      - "java_src/**"
+      - "assets/**"
+      - "buildozer.spec"
+      - "tools/patch_p4a.py"
+      - "tools/fetch_voice.py"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # Si en GitHub se subió solo MIIA_Android.zip (sin descomprimir), se desempaqueta aquí.
+      - name: Desempaquetar el proyecto (si se subió como zip)
+        run: |
+          if [ ! -f buildozer.spec ]; then
+            z="$(ls -1 *.zip 2>/dev/null | head -n1)"
+            test -n "$z" || { echo "No encuentro buildozer.spec ni un .zip con el proyecto"; exit 1; }
+            unzip -q -o "$z"
+            d="$(find . -maxdepth 2 -name buildozer.spec -printf '%h\n' | head -n1)"
+            test -n "$d" || { echo "El zip no trae buildozer.spec"; exit 1; }
+            [ "$d" = "." ] || cp -a "$d"/. .
+          fi
+          ls
+
+      # El código de MIIA pesa menos de 1 MB. Lo que llena el equipo de GitHub es la herramienta de Android
+      # (SDK, NDK, Gradle) y la compilación. Se libera espacio y se agrega memoria de apoyo antes de empezar.
+      - name: Liberar espacio y agregar memoria de apoyo
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo apt-get clean
+          df -h /
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Pruebas de la lógica (rápidas; no bloquean la compilación)
+        continue-on-error: true
+        run: python tests/test_logic.py
+
+      - name: Paquetes del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf automake libtool libtool-bin pkg-config build-essential \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev libltdl-dev ccache
+
+      - name: Herramientas de Python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "buildozer>=1.5.0,<2" "cython==0.29.34" virtualenv
+
+      # Voz offline: sherpa-onnx 1.13.8 (librerías de Android + API Java) y la voz Piper en español. Sin internet en el
+      # teléfono, sin cuentas y sin tokens. Si algo falla aquí, la compilación se detiene (no se hace un APK mudo).
+      - name: Descargar la voz offline (sherpa-onnx + voz Piper)
+        env:
+          MIIA_VOICE_MODEL: ${{ inputs.voice_model }}
+        run: python tools/fetch_voice.py --archs armeabi-v7a,arm64-v8a
+
+      # Compilar solo la clase de la voz tarda un segundo; así un error de Java sale ahora y no a los 40 minutos.
+      - name: Comprobar que el Java de la voz compila
+        run: |
+          mkdir -p "$RUNNER_TEMP/jout"
+          javac -Xlint:-removal -d "$RUNNER_TEMP/jout" -sourcepath java_src java_src/org/miia/voice/MiiaTts.java
+          ls "$RUNNER_TEMP/jout/org/miia/voice"
+
+      - name: Descargar python-for-android y prepararlo para MIIA
+        run: |
+          git clone --depth 1 --branch v2024.01.21 https://github.com/kivy/python-for-android.git p4a_src
+          python tools/patch_p4a.py p4a_src java_src
+
+      - name: Firma estable (para poder actualizar la app sin perder datos)
+        run: |
+          mkdir -p ~/.android
+          cp signing/debug.keystore ~/.android/debug.keystore
+
+      # Buildozer trae un sdkmanager viejo que NO funciona con Java 17 (error NoClassDefFoundError javax/xml/bind).
+      # Se instala aquí el sdkmanager moderno y se deja un atajo en la ruta vieja para que Buildozer lo use.
+      - name: Preparar el SDK de Android (herramientas modernas)
+        run: |
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDK/cmdline-tools" "$SDK/tools/bin"
+          cd "$RUNNER_TEMP"
+          for v in 11076708 11479570 13114758; do
+            if curl -fsSL -o cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-${v}_latest.zip"; then break; fi
+          done
+          test -s cmdtools.zip
+          unzip -q cmdtools.zip -d cmdtools_tmp
+          rm -rf "$SDK/cmdline-tools/latest"
+          mv cmdtools_tmp/cmdline-tools "$SDK/cmdline-tools/latest"
+          printf '#!/bin/sh\nexec "%s/cmdline-tools/latest/bin/sdkmanager" "$@"\n' "$SDK" > "$SDK/tools/bin/sdkmanager"
+          chmod +x "$SDK/tools/bin/sdkmanager"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+          cat "$SDK/tools/bin/sdkmanager"
+          ls "$SDK/platforms" "$SDK/build-tools"
+
+      # Sin "-v": el modo detallado escribe cientos de miles de líneas y GitHub corta o se traba con registros
+      # enormes. Todo se guarda en un archivo; si falla, se muestran las últimas 150 líneas y se sube el archivo.
+      - name: Compilar
+        env:
+          GRADLE_OPTS: "-Xmx2g -Dorg.gradle.daemon=false"
+        run: |
+          unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME
+          yes | buildozer android debug > build.log 2>&1 || { echo "=== ÚLTIMAS LÍNEAS DEL REGISTRO ==="; tail -n 150 build.log; df -h /; free -h; exit 1; }
+          tail -n 15 build.log
+          ls -la bin/
+
+      - name: Guardar el registro completo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registro-compilacion
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Guardar el APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIIA-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
